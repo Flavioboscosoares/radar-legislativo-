@@ -37,11 +37,18 @@ interface DeputyInfo {
 const yearMemoryCache = new Map<number, CachedEntry<YearDataset>>();
 const yearInFlight = new Map<number, Promise<YearDataset>>();
 
+const liveMemoryCache = new Map<string, CachedEntry<ProjetoLei[]>>();
+const liveInFlight = new Map<string, Promise<ProjetoLei[]>>();
+
 let deputadosMapCache: CachedEntry<Map<number, DeputyInfo>> | null = null;
 let deputadosMapInFlight: Promise<Map<number, DeputyInfo>> | null = null;
 
 // Autoria de proposição individual pode ser cacheada em memória por algumas horas
 const propPrimaryAuthorCache = new Map<number, CachedEntry<ProjetoLei | null>>();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export function isSupportedYear(year: number): year is SupportedYear {
   return (SUPPORTED_YEARS as readonly number[]).includes(year);
@@ -55,31 +62,48 @@ function getYearTtlMs(year: number): number {
   return year >= getCurrentBrasiliaYear() ? 15 * 60 * 1000 : 24 * 60 * 60 * 1000;
 }
 
-async function fetchJsonWithTimeout<T>(url: string, timeoutMs = 45000): Promise<{
+async function fetchJsonWithTimeout<T>(
+  url: string,
+  timeoutMs = 45000,
+  retries = 2,
+): Promise<{
   data: T;
   lastModified: string | null;
 }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'RadarLegislativo/1.0 (https://github.com/radar-legislativo)',
-      },
-      cache: 'no-store',
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status} ao consultar ${url}`);
+  let attempt = 0;
+  while (true) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'RadarLegislativo/1.0 (https://github.com/radar-legislativo)',
+        },
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      if (res.status === 429 && attempt < retries) {
+        attempt++;
+        const retryAfterSec = Number(res.headers.get('retry-after'));
+        const backoffMs =
+          Number.isFinite(retryAfterSec) && retryAfterSec > 0
+            ? Math.min(retryAfterSec * 1000, 3000)
+            : 600 * attempt;
+        await sleep(backoffMs);
+        continue;
+      }
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ao consultar ${url}`);
+      }
+      const data = (await res.json()) as T;
+      return {
+        data,
+        lastModified: res.headers.get('last-modified'),
+      };
+    } finally {
+      clearTimeout(timer);
     }
-    const data = (await res.json()) as T;
-    return {
-      data,
-      lastModified: res.headers.get('last-modified'),
-    };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -221,81 +245,126 @@ export async function getLivePropositions(sinceDateKey?: string): Promise<Projet
       ? sinceDateKey
       : shiftDateKey(todayKey, -3);
 
-  const url = `${CAMARA_BASE}/api/v2/proposicoes?siglaTipo=PL&siglaTipo=PLP&dataApresentacaoInicio=${effectiveSince}&ordem=DESC&ordenarPor=id&itens=100`;
-
-  const [{ data }, deputadosMap] = await Promise.all([
-    fetchJsonWithTimeout<{ dados?: RawBulkProposicao[] }>(url, 20000),
-    getDeputadosMap(),
-  ]);
-
-  const rawProps = (data.dados ?? []).filter((p) => {
-    if (!isPlOrPlp(p.siglaTipo)) return false;
-    const dKey = extractDateKey(p.dataApresentacao);
-    return dKey >= effectiveSince;
-  });
-
   const now = Date.now();
-  const resolved = await mapWithConcurrency(rawProps, 8, async (prop): Promise<ProjetoLei | null> => {
-    const cached = propPrimaryAuthorCache.get(prop.id);
-    if (cached && cached.expiresAt > now) {
-      return cached.value;
-    }
+  const cachedLive = liveMemoryCache.get(effectiveSince);
+  if (cachedLive && cachedLive.expiresAt > now) {
+    return cachedLive.value;
+  }
 
+  const pending = liveInFlight.get(effectiveSince);
+  if (pending) {
+    return pending;
+  }
+
+  const job = (async (): Promise<ProjetoLei[]> => {
     try {
-      const { data: autRes } = await fetchJsonWithTimeout<{ dados?: RawRestAutor[] }>(
-        `${CAMARA_BASE}/api/v2/proposicoes/${prop.id}/autores`,
-        12000,
-      );
-      const primary = pickPrimaryAuthor(autRes.dados ?? []);
-      if (!primary) {
-        propPrimaryAuthorCache.set(prop.id, { value: null, expiresAt: now + 6 * 60 * 60 * 1000 });
-        return null;
-      }
+      const url = `${CAMARA_BASE}/api/v2/proposicoes?siglaTipo=PL&siglaTipo=PLP&dataApresentacaoInicio=${effectiveSince}&ordem=DESC&ordenarPor=id&itens=100`;
 
-      const deputyId = extractDeputyIdFromUri(primary.uri);
-      if (!deputyId) {
-        // Autor não é deputado (Executivo, Comissão, etc.) -> descartar conforme regra
-        propPrimaryAuthorCache.set(prop.id, { value: null, expiresAt: now + 6 * 60 * 60 * 1000 });
-        return null;
-      }
+      const [{ data }, deputadosMap] = await Promise.all([
+        fetchJsonWithTimeout<{ dados?: RawBulkProposicao[] }>(url, 20000),
+        getDeputadosMap(),
+      ]);
 
-      const depInfo = await resolveDeputyInfo(deputyId, deputadosMap);
-      if (!depInfo || !VALID_UF_SET.has(depInfo.uf)) {
-        propPrimaryAuthorCache.set(prop.id, { value: null, expiresAt: now + 6 * 60 * 60 * 1000 });
-        return null;
-      }
-
-      const dataApresentacao = prop.dataApresentacao ?? '';
-      const dateKey = extractDateKey(dataApresentacao);
-      const yearFromDate = Number(dateKey.slice(0, 4)) || getCurrentBrasiliaYear();
-
-      const item: ProjetoLei = {
-        id: prop.id,
-        tipo: prop.siglaTipo as 'PL' | 'PLP',
-        numero: Number(prop.numero) || 0,
-        ano: Number(prop.ano) || yearFromDate,
-        dataApresentacao,
-        dateKey,
-        timestamp: parseBrasiliaTimestamp(dataApresentacao),
-        uf: depInfo.uf,
-        autorNome: (primary.nome ?? 'Deputado(a)').trim(),
-        autorPartido: depInfo.partido,
-        ementa: truncateEmenta(prop.ementa),
-      };
-
-      propPrimaryAuthorCache.set(prop.id, {
-        value: item,
-        expiresAt: now + 6 * 60 * 60 * 1000,
+      const rawProps = (data.dados ?? []).filter((p) => {
+        if (!isPlOrPlp(p.siglaTipo)) return false;
+        const dKey = extractDateKey(p.dataApresentacao);
+        return dKey >= effectiveSince;
       });
-      return item;
-    } catch {
-      return null;
-    }
-  });
 
-  return resolved
-    .filter((item): item is ProjetoLei => item !== null)
-    .sort((a, b) => a.timestamp - b.timestamp || a.id - b.id);
+      const resolvedNow = Date.now();
+      const resolved = await mapWithConcurrency(
+        rawProps,
+        3,
+        async (prop): Promise<ProjetoLei | null> => {
+          const cached = propPrimaryAuthorCache.get(prop.id);
+          if (cached && cached.expiresAt > resolvedNow) {
+            return cached.value;
+          }
+
+          try {
+            const { data: autRes } = await fetchJsonWithTimeout<{ dados?: RawRestAutor[] }>(
+              `${CAMARA_BASE}/api/v2/proposicoes/${prop.id}/autores`,
+              12000,
+            );
+            const primary = pickPrimaryAuthor(autRes.dados ?? []);
+            if (!primary) {
+              propPrimaryAuthorCache.set(prop.id, {
+                value: null,
+                expiresAt: resolvedNow + 6 * 60 * 60 * 1000,
+              });
+              return null;
+            }
+
+            const deputyId = extractDeputyIdFromUri(primary.uri);
+            if (!deputyId) {
+              // Autor não é deputado (Executivo, Comissão, etc.) -> descartar conforme regra
+              propPrimaryAuthorCache.set(prop.id, {
+                value: null,
+                expiresAt: resolvedNow + 6 * 60 * 60 * 1000,
+              });
+              return null;
+            }
+
+            const depInfo = await resolveDeputyInfo(deputyId, deputadosMap);
+            if (!depInfo || !VALID_UF_SET.has(depInfo.uf)) {
+              propPrimaryAuthorCache.set(prop.id, {
+                value: null,
+                expiresAt: resolvedNow + 6 * 60 * 60 * 1000,
+              });
+              return null;
+            }
+
+            const dataApresentacao = prop.dataApresentacao ?? '';
+            const dateKey = extractDateKey(dataApresentacao);
+            const yearFromDate = Number(dateKey.slice(0, 4)) || getCurrentBrasiliaYear();
+
+            const item: ProjetoLei = {
+              id: prop.id,
+              tipo: prop.siglaTipo as 'PL' | 'PLP',
+              numero: Number(prop.numero) || 0,
+              ano: Number(prop.ano) || yearFromDate,
+              dataApresentacao,
+              dateKey,
+              timestamp: parseBrasiliaTimestamp(dataApresentacao),
+              uf: depInfo.uf,
+              autorNome: (primary.nome ?? 'Deputado(a)').trim(),
+              autorPartido: depInfo.partido,
+              ementa: truncateEmenta(prop.ementa),
+            };
+
+            propPrimaryAuthorCache.set(prop.id, {
+              value: item,
+              expiresAt: resolvedNow + 6 * 60 * 60 * 1000,
+            });
+            return item;
+          } catch {
+            return null;
+          }
+        },
+      );
+
+      const result = resolved
+        .filter((item): item is ProjetoLei => item !== null)
+        .sort((a, b) => a.timestamp - b.timestamp || a.id - b.id);
+
+      liveMemoryCache.set(effectiveSince, {
+        value: result,
+        expiresAt: Date.now() + 45 * 1000,
+      });
+      return result;
+    } catch (err) {
+      // Se Câmara retornar 429 e houver cache anterior (mesmo vencido), retorna o último conhecido
+      if (cachedLive) {
+        return cachedLive.value;
+      }
+      throw err;
+    } finally {
+      liveInFlight.delete(effectiveSince);
+    }
+  })();
+
+  liveInFlight.set(effectiveSince, job);
+  return job;
 }
 
 /**
