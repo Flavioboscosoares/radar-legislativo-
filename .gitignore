@@ -40,3 +40,5 @@ next-env.d.ts
 
 # local cache
 .cache
+
+.vercel
